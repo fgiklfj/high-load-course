@@ -54,21 +54,21 @@ class PaymentExternalSystemAdapterImpl(
 
         logger.info("[$accountName] Submit: $paymentId , txId: $transactionId")
 
-        while (!rateLimiter.acquirePermission()) {
-            if (now() >= deadline) {
-                logger.error("[$accountName] [ERROR] Rate limiter wait exceeded deadline, transactionID: $transactionId, paymentID: $paymentId")
-                paymentESService.update(paymentId) {
-                    it.logProcessing(false, now(), transactionId, reason = "Deadline exceeded while waiting for rate limiter")
-                }
-                return
-            }
-        }
-
         while (!parallelRequestsSemaphore.tryAcquire()) {
             if (now() >= deadline) {
                 logger.error("[$accountName] [ERROR] Parallel requests limit wait exceeded deadline, transactionID: $transactionId, paymentID: $paymentId")
                 paymentESService.update(paymentId) {
                     it.logProcessing(false, now(), transactionId, reason = "Deadline exceeded while waiting for parallel requests limit")
+                }
+                return
+            }
+        }
+
+        while (!rateLimiter.acquirePermission()) {
+            if (now() >= deadline) {
+                logger.error("[$accountName] [ERROR] Rate limiter wait exceeded deadline, transactionID: $transactionId, paymentID: $paymentId")
+                paymentESService.update(paymentId) {
+                    it.logProcessing(false, now(), transactionId, reason = "Deadline exceeded while waiting for rate limiter")
                 }
                 return
             }
