@@ -6,11 +6,13 @@ import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody
 import org.slf4j.LoggerFactory
+import ru.quipy.common.utils.makeRateLimiter
 import ru.quipy.core.EventSourcingService
 import ru.quipy.payments.api.PaymentAggregate
 import java.net.SocketTimeoutException
 import java.time.Duration
 import java.util.*
+import java.util.concurrent.Semaphore
 
 
 // Advice: always treat time as a Duration
@@ -34,6 +36,9 @@ class PaymentExternalSystemAdapterImpl(
     private val rateLimitPerSec = properties.rateLimitPerSec
     private val parallelRequests = properties.parallelRequests
 
+    private val rateLimiter = makeRateLimiter(accountName, rateLimitPerSec)
+    private val parallelRequestsSemaphore = Semaphore(parallelRequests)
+
     private val client = OkHttpClient.Builder().build()
 
     override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
@@ -48,6 +53,26 @@ class PaymentExternalSystemAdapterImpl(
         }
 
         logger.info("[$accountName] Submit: $paymentId , txId: $transactionId")
+
+        while (!rateLimiter.acquirePermission()) {
+            if (now() >= deadline) {
+                logger.error("[$accountName] [ERROR] Rate limiter wait exceeded deadline, transactionID: $transactionId, paymentID: $paymentId")
+                paymentESService.update(paymentId) {
+                    it.logProcessing(false, now(), transactionId, reason = "Deadline exceeded while waiting for rate limiter")
+                }
+                return
+            }
+        }
+
+        while (!parallelRequestsSemaphore.tryAcquire()) {
+            if (now() >= deadline) {
+                logger.error("[$accountName] [ERROR] Parallel requests limit wait exceeded deadline, transactionID: $transactionId, paymentID: $paymentId")
+                paymentESService.update(paymentId) {
+                    it.logProcessing(false, now(), transactionId, reason = "Deadline exceeded while waiting for parallel requests limit")
+                }
+                return
+            }
+        }
 
         try {
             val request = Request.Builder().run {
@@ -88,6 +113,8 @@ class PaymentExternalSystemAdapterImpl(
                     }
                 }
             }
+        } finally {
+            parallelRequestsSemaphore.release()
         }
     }
 
