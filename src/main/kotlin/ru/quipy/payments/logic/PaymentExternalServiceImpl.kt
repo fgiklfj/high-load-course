@@ -74,6 +74,8 @@ class PaymentExternalSystemAdapterImpl(
                     }
                     return
                 }
+
+                Thread.sleep(10)
             }
 
             val request = Request.Builder().run {
