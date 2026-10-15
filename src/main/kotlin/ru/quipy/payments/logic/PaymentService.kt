@@ -8,7 +8,10 @@ interface PaymentService {
      * Submit payment request to some external service.
      */
     fun submitPaymentRequest(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long)
+    fun reserve(deadline: Long)
 }
+
+class TooManyRequestsException(val retryAfterMillis: Long) : RuntimeException("Payment can't be processed before deadline")
 
 /**
  * Adapter for external payment system. Represents the account in the external system.
@@ -18,6 +21,10 @@ interface PaymentService {
  */
 interface PaymentExternalSystemAdapter {
     fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long)
+
+    fun tryReserve(deadline: Long): Long
+
+    fun release()
 
     fun name(): String
 

@@ -26,4 +26,16 @@ class PaymentSystemImpl(
             account.performPaymentAsync(paymentId, amount, paymentStartedAt, deadline)
         }
     }
+
+    override fun reserve(deadline: Long) {
+        val reserved = mutableListOf<PaymentExternalSystemAdapter>()
+        for (account in paymentAccounts) {
+            val retryAfter = account.tryReserve(deadline)
+            if (retryAfter > 0) {
+                reserved.forEach { it.release() }
+                throw TooManyRequestsException(retryAfter)
+            }
+            reserved += account
+        }
+    }
 }
