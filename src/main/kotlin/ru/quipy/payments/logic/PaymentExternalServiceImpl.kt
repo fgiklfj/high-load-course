@@ -14,6 +14,8 @@ import java.time.Duration
 import java.util.*
 import java.util.concurrent.Semaphore
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
+import kotlin.math.ceil
 
 
 // Advice: always treat time as a Duration
@@ -29,6 +31,8 @@ class PaymentExternalSystemAdapterImpl(
 
         val emptyBody = RequestBody.create(null, ByteArray(0))
         val mapper = ObjectMapper().registerKotlinModule()
+
+        const val SAFETY_FACTOR = 1.3
     }
 
     private val serviceName = properties.serviceName
@@ -42,7 +46,39 @@ class PaymentExternalSystemAdapterImpl(
 
     private val client = OkHttpClient.Builder().build()
 
+    private val throughputPerMillis = minOf(
+        parallelRequests.toDouble() / requestAverageProcessingTime.toMillis(),
+        rateLimitPerSec / 1000.0,
+    )
+
+    private val inFlight = AtomicInteger(0)
+
+    override fun tryReserve(deadline: Long): Long {
+        while (true) {
+            val current = inFlight.get()
+            val expectedDuration = (current / throughputPerMillis + requestAverageProcessingTime.toMillis()) * SAFETY_FACTOR
+            val expectedFinish = now() + expectedDuration.toLong()
+            if (expectedFinish > deadline) {
+                val excess = ceil((expectedFinish - deadline) * throughputPerMillis).coerceAtLeast(1.0)
+                return (excess / throughputPerMillis).toLong().coerceAtLeast(1)
+            }
+            if (inFlight.compareAndSet(current, current + 1)) return 0
+        }
+    }
+
+    override fun release() {
+        inFlight.decrementAndGet()
+    }
+
     override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
+        try {
+            doPerformPayment(paymentId, amount, paymentStartedAt, deadline)
+        } finally {
+            release()
+        }
+    }
+
+    private fun doPerformPayment(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
         logger.warn("[$accountName] Submitting payment request for payment $paymentId")
 
         val transactionId = UUID.randomUUID()
