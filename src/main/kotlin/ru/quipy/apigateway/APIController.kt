@@ -1,5 +1,7 @@
 package ru.quipy.apigateway
 
+import io.micrometer.core.instrument.Counter
+import io.micrometer.core.instrument.MeterRegistry
 import org.slf4j.Logger
 import org.slf4j.LoggerFactory
 import org.springframework.beans.factory.annotation.Autowired
@@ -14,9 +16,19 @@ import ru.quipy.payments.logic.TooManyRequestsException
 import java.util.*
 
 @RestController
-class APIController {
+class APIController(meterRegistry: MeterRegistry) {
 
     val logger: Logger = LoggerFactory.getLogger(APIController::class.java)
+
+    private val incomingCounter = Counter.builder("payments.incoming")
+        .description("Incoming payment requests")
+        .register(meterRegistry)
+
+    private val rejectedCounter = Counter.builder("payments.completed")
+        .description("Payments rejected with 429 before being sent")
+        .tag("account", "none")
+        .tag("result", "rejected")
+        .register(meterRegistry)
 
     @Autowired
     private lateinit var orderRepository: OrderRepository
@@ -64,6 +76,7 @@ class APIController {
 
     @PostMapping("/orders/{orderId}/payment")
     fun payOrder(@PathVariable orderId: UUID, @RequestParam deadline: Long): PaymentSubmissionDto {
+        incomingCounter.increment()
         val paymentId = UUID.randomUUID()
         val order = orderRepository.findById(orderId) ?: throw IllegalArgumentException("No such order $orderId")
         paymentService.reserve(deadline)
@@ -75,6 +88,7 @@ class APIController {
 
     @ExceptionHandler(TooManyRequestsException::class)
     fun handleTooManyRequests(e: TooManyRequestsException): ResponseEntity<Void> {
+        rejectedCounter.increment()
         val retryAfterSeconds = (e.retryAfterMillis + 999) / 1000
         return ResponseEntity.status(HttpStatus.TOO_MANY_REQUESTS)
             .header(HttpHeaders.RETRY_AFTER, retryAfterSeconds.toString())
