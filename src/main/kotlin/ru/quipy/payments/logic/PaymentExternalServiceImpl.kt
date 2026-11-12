@@ -37,6 +37,10 @@ class PaymentExternalSystemAdapterImpl(
         val mapper = ObjectMapper().registerKotlinModule()
 
         const val DEADLINE_MARGIN_MILLIS = 150L
+
+        const val RETRY_DELAY_MILLIS = 200L
+        const val MAX_PAYMENT_ATTEMPTS = 2
+        const val TEMPORARY_ERROR_MESSAGE = "Temporary error"
     }
 
     private val serviceName = properties.serviceName
@@ -138,61 +142,76 @@ class PaymentExternalSystemAdapterImpl(
         }
 
         try {
-            if (!awaitRatePermit(deadline)) {
-                completed("deadline_exceeded")
-                paymentESService.update(paymentId) {
-                    it.logProcessing(false, now(), transactionId, reason = "Deadline exceeded while waiting for rate limiter")
+            for (attempt in 1..MAX_PAYMENT_ATTEMPTS) {
+                if (!awaitRatePermit(deadline)) {
+                    completed("deadline_exceeded")
+                    paymentESService.update(paymentId) {
+                        it.logProcessing(
+                            false,
+                            now(),
+                            transactionId,
+                            reason = "Deadline exceeded while waiting for rate limiter"
+                        )
+                    }
+                    return
                 }
-                return
-            }
 
-            val request = Request.Builder().run {
-                url("http://$paymentProviderHostPort/external/process?serviceName=$serviceName&token=$token&accountName=$accountName&transactionId=$transactionId&paymentId=$paymentId&amount=$amount")
-                post(emptyBody)
-            }.build()
+                val request = Request.Builder().run {
+                    url(
+                        "http://$paymentProviderHostPort/external/process?" +
+                            "serviceName=$serviceName&token=$token&accountName=$accountName&" +
+                            "transactionId=$transactionId&paymentId=$paymentId&amount=$amount"
+                    )
+                    post(emptyBody)
+                }.build()
 
-            outgoingCounter.increment()
-            processing.incrementAndGet()
-            try {
-                client.newCall(request).execute().use { response ->
-                    val body = try {
+                outgoingCounter.increment()
+                processing.incrementAndGet()
+
+                val body = try {
+                    client.newCall(request).execute().use { response ->
                         mapper.readValue(response.body?.string(), ExternalSysResponse::class.java)
-                    } catch (e: Exception) {
-                        logger.error("[$accountName] [ERROR] Payment processed for txId: $transactionId, payment: $paymentId, result code: ${response.code}, reason: ${response.body?.string()}")
-                        ExternalSysResponse(transactionId.toString(), paymentId.toString(),false, e.message)
                     }
-
-                    logger.warn("[$accountName] Payment processed for txId: $transactionId, payment: $paymentId, succeeded: ${body.result}, message: ${body.message}")
-                    completed(if (body.result) "success" else "failure")
-
-                    // Здесь мы обновляем состояние оплаты в зависимости от результата в базе данных оплат.
-                    // Это требуется сделать ВО ВСЕХ ИСХОДАХ (успешная оплата / неуспешная / ошибочная ситуация)
-                    paymentESService.update(paymentId) {
-                        it.logProcessing(body.result, now(), transactionId, reason = body.message)
-                    }
+                } catch (e: Exception) {
+                    logger.error("[$accountName] Payment failed for txId: $transactionId", e)
+                    ExternalSysResponse(
+                        transactionId.toString(),
+                        paymentId.toString(),
+                        false,
+                        e.message
+                    )
+                } finally {
+                    processing.decrementAndGet()
                 }
-            } finally {
-                processing.decrementAndGet()
+
+                logger.warn(
+                    "[$accountName] Payment processed for txId: $transactionId, " +
+                        "payment: $paymentId, succeeded: ${body.result}, message: ${body.message}"
+                )
+
+                if (body.result) {
+                    completed("success")
+                    paymentESService.update(paymentId) {
+                        it.logProcessing(true, now(), transactionId, reason = body.message)
+                    }
+                    return
+                }
+
+                val canRetry = body.message == TEMPORARY_ERROR_MESSAGE &&
+                    attempt < MAX_PAYMENT_ATTEMPTS &&
+                    deadline - now() > RETRY_DELAY_MILLIS + requestAverageProcessingTime.toMillis()
+
+                if (!canRetry) {
+                    completed("failure")
+                    paymentESService.update(paymentId) {
+                        it.logProcessing(false, now(), transactionId, reason = body.message)
+                    }
+                    return
+                }
+
+                Thread.sleep(RETRY_DELAY_MILLIS)
             }
-        } catch (e: Exception) {
-            when (e) {
-                is SocketTimeoutException -> {
-                    logger.error("[$accountName] Payment timeout for txId: $transactionId, payment: $paymentId", e)
-                    completed("timeout")
-                    paymentESService.update(paymentId) {
-                        it.logProcessing(false, now(), transactionId, reason = "Request timeout.")
-                    }
-                }
 
-                else -> {
-                    logger.error("[$accountName] Payment failed for txId: $transactionId, payment: $paymentId", e)
-                    completed("error")
-
-                    paymentESService.update(paymentId) {
-                        it.logProcessing(false, now(), transactionId, reason = e.message)
-                    }
-                }
-            }
         } finally {
             parallelRequestsSemaphore.release()
         }
