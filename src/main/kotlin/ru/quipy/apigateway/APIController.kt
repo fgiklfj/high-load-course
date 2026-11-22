@@ -15,6 +15,9 @@ import ru.quipy.payments.logic.PaymentService
 import ru.quipy.payments.logic.TooManyRequestsException
 import java.util.*
 
+import ru.quipy.common.utils.TokenBucketRateLimiter
+import java.util.concurrent.TimeUnit
+
 @RestController
 class APIController(meterRegistry: MeterRegistry) {
 
@@ -29,6 +32,13 @@ class APIController(meterRegistry: MeterRegistry) {
         .tag("account", "none")
         .tag("result", "rejected")
         .register(meterRegistry)
+
+    private val incomingRateLimiter = TokenBucketRateLimiter(
+        rate = 10,
+        bucketMaxCapacity = 10,
+        window = 1,
+        timeUnit = TimeUnit.MILLISECONDS,
+    )
 
     @Autowired
     private lateinit var orderRepository: OrderRepository
@@ -77,6 +87,11 @@ class APIController(meterRegistry: MeterRegistry) {
     @PostMapping("/orders/{orderId}/payment")
     fun payOrder(@PathVariable orderId: UUID, @RequestParam deadline: Long): PaymentSubmissionDto {
         incomingCounter.increment()
+
+        if (!incomingRateLimiter.tick()) {
+            throw TooManyRequestsException(1000L)
+        }
+
         val paymentId = UUID.randomUUID()
         val order = orderRepository.findById(orderId) ?: throw IllegalArgumentException("No such order $orderId")
         paymentService.reserve(deadline)
