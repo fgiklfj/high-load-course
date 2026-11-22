@@ -33,6 +33,21 @@ class SlidingWindowRateLimiter(
         }
     }
 
+    fun estimateWaitMillis(waitersAhead: Int): Long {
+        require(waitersAhead >= 0)
+        val now = System.currentTimeMillis()
+        val timestamps = java.util.PriorityQueue<Long>()
+        queue.forEach { if (it.timestamp + window.toMillis() > now) timestamps.add(it.timestamp) }
+        var availableAt = now
+        repeat(waitersAhead + 1) {
+            if (timestamps.size.toLong() >= rate) {
+                availableAt = maxOf(availableAt, timestamps.remove() + window.toMillis())
+            }
+            timestamps.add(availableAt)
+        }
+        return availableAt - now
+    }
+
     fun tickBlocking() {
         while (!tick()) {
             Thread.sleep(10)

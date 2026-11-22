@@ -18,7 +18,7 @@ import java.util.*
 import java.util.concurrent.Semaphore
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
-import kotlin.math.ceil
+import java.util.concurrent.locks.ReentrantLock
 
 
 // Advice: always treat time as a Duration
@@ -36,7 +36,7 @@ class PaymentExternalSystemAdapterImpl(
         val emptyBody = RequestBody.create(null, ByteArray(0))
         val mapper = ObjectMapper().registerKotlinModule()
 
-        const val SAFETY_FACTOR = 1.3
+        const val DEADLINE_MARGIN_MILLIS = 150L
     }
 
     private val serviceName = properties.serviceName
@@ -46,6 +46,7 @@ class PaymentExternalSystemAdapterImpl(
     private val parallelRequests = properties.parallelRequests
 
     private val rateLimiter = SlidingWindowRateLimiter(rateLimitPerSec.toLong(), Duration.ofSeconds(1))
+    private val rateWaitLock = ReentrantLock(true)
     private val parallelRequestsSemaphore = Semaphore(parallelRequests, true)
 
     private val client = OkHttpClient.Builder().build()
@@ -56,6 +57,7 @@ class PaymentExternalSystemAdapterImpl(
     )
 
     private val inFlight = AtomicInteger(0)
+    private val processing = AtomicInteger(0)
 
     private val outgoingCounter = Counter.builder("payments.outgoing")
         .description("Requests sent to the external payment system")
@@ -84,11 +86,16 @@ class PaymentExternalSystemAdapterImpl(
     override fun tryReserve(deadline: Long): Long {
         while (true) {
             val current = inFlight.get()
-            val expectedDuration = (current / throughputPerMillis + requestAverageProcessingTime.toMillis()) * SAFETY_FACTOR
+            val waiting = (current - processing.get()).coerceAtLeast(0)
+            val processingMillis = requestAverageProcessingTime.toMillis()
+            val expectedDuration = if (deadline - now() <= processingMillis * 4) {
+                rateLimiter.estimateWaitMillis(waiting) + processingMillis * 2.0 + DEADLINE_MARGIN_MILLIS
+            } else {
+                waiting / throughputPerMillis + processingMillis + DEADLINE_MARGIN_MILLIS
+            }
             val expectedFinish = now() + expectedDuration.toLong()
             if (expectedFinish > deadline) {
-                val excess = ceil((expectedFinish - deadline) * throughputPerMillis).coerceAtLeast(1.0)
-                return (excess / throughputPerMillis).toLong().coerceAtLeast(1)
+                return 1000L
             }
             if (inFlight.compareAndSet(current, current + 1)) return 0
         }
@@ -131,17 +138,12 @@ class PaymentExternalSystemAdapterImpl(
         }
 
         try {
-            while (!rateLimiter.tick()) {
-                if (now() >= deadline) {
-                    logger.error("[$accountName] [ERROR] Rate limiter wait exceeded deadline, transactionID: $transactionId, paymentID: $paymentId")
-                    completed("deadline_exceeded")
-                    paymentESService.update(paymentId) {
-                        it.logProcessing(false, now(), transactionId, reason = "Deadline exceeded while waiting for rate limiter")
-                    }
-                    return
+            if (!awaitRatePermit(deadline)) {
+                completed("deadline_exceeded")
+                paymentESService.update(paymentId) {
+                    it.logProcessing(false, now(), transactionId, reason = "Deadline exceeded while waiting for rate limiter")
                 }
-
-                Thread.sleep(10)
+                return
             }
 
             val request = Request.Builder().run {
@@ -150,22 +152,27 @@ class PaymentExternalSystemAdapterImpl(
             }.build()
 
             outgoingCounter.increment()
-            client.newCall(request).execute().use { response ->
-                val body = try {
-                    mapper.readValue(response.body?.string(), ExternalSysResponse::class.java)
-                } catch (e: Exception) {
-                    logger.error("[$accountName] [ERROR] Payment processed for txId: $transactionId, payment: $paymentId, result code: ${response.code}, reason: ${response.body?.string()}")
-                    ExternalSysResponse(transactionId.toString(), paymentId.toString(),false, e.message)
-                }
+            processing.incrementAndGet()
+            try {
+                client.newCall(request).execute().use { response ->
+                    val body = try {
+                        mapper.readValue(response.body?.string(), ExternalSysResponse::class.java)
+                    } catch (e: Exception) {
+                        logger.error("[$accountName] [ERROR] Payment processed for txId: $transactionId, payment: $paymentId, result code: ${response.code}, reason: ${response.body?.string()}")
+                        ExternalSysResponse(transactionId.toString(), paymentId.toString(),false, e.message)
+                    }
 
-                logger.warn("[$accountName] Payment processed for txId: $transactionId, payment: $paymentId, succeeded: ${body.result}, message: ${body.message}")
-                completed(if (body.result) "success" else "failure")
+                    logger.warn("[$accountName] Payment processed for txId: $transactionId, payment: $paymentId, succeeded: ${body.result}, message: ${body.message}")
+                    completed(if (body.result) "success" else "failure")
 
-                // Здесь мы обновляем состояние оплаты в зависимости от результата в базе данных оплат.
-                // Это требуется сделать ВО ВСЕХ ИСХОДАХ (успешная оплата / неуспешная / ошибочная ситуация)
-                paymentESService.update(paymentId) {
-                    it.logProcessing(body.result, now(), transactionId, reason = body.message)
+                    // Здесь мы обновляем состояние оплаты в зависимости от результата в базе данных оплат.
+                    // Это требуется сделать ВО ВСЕХ ИСХОДАХ (успешная оплата / неуспешная / ошибочная ситуация)
+                    paymentESService.update(paymentId) {
+                        it.logProcessing(body.result, now(), transactionId, reason = body.message)
+                    }
                 }
+            } finally {
+                processing.decrementAndGet()
             }
         } catch (e: Exception) {
             when (e) {
@@ -188,6 +195,20 @@ class PaymentExternalSystemAdapterImpl(
             }
         } finally {
             parallelRequestsSemaphore.release()
+        }
+    }
+
+    private fun awaitRatePermit(deadline: Long): Boolean {
+        val remaining = deadline - now()
+        if (remaining <= 0 || !rateWaitLock.tryLock(remaining, TimeUnit.MILLISECONDS)) return false
+        try {
+            while (now() < deadline) {
+                if (rateLimiter.tick()) return true
+                Thread.sleep(1)
+            }
+            return false
+        } finally {
+            rateWaitLock.unlock()
         }
     }
 
